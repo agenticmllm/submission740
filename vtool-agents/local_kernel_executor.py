@@ -113,16 +113,6 @@ class ExecutionResult:
 
 
 class LocalKernelExecutor:
-    """
-    Persistent, per-sample Python executor built on a local Jupyter kernel.
-
-    This is intentionally not a security sandbox on par with a VM or container,
-    but it is a substantial upgrade over launching arbitrary temp scripts:
-    - one fresh workspace per sample
-    - one persistent Python state per sample
-    - optional resource limits applied inside the kernel process
-    - API-like structured results for the model
-    """
 
     def __init__(
         self,
@@ -433,7 +423,6 @@ except Exception as e:
     print(f'BOOTSTRAP_WARNING: {{e}}', file=sys.stderr)
 """
         result = self.execute_python(bootstrap_code)
-        # Ignore non-fatal bootstrap warnings, but fail on true bootstrap errors.
         if result.status not in ("success",):
             raise RuntimeError(result.to_tool_message())
         self._bootstrapped = True

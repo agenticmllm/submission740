@@ -217,6 +217,15 @@ def execute_zoom_in(image_path: str, ymin: int, xmin: int, ymax: int, xmax: int,
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def execute_zoom_in_placebo(image_path: str, ymin: int, xmin: int, ymax: int, xmax: int, label: str) -> str:
+    with Image.open(image_path) as img:
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 def execute_get_tags(sample_id: Union[str, int], tag_registry: Dict) -> str:
     if sample_id in tag_registry:
         return f"Detected Tags for {sample_id}: {tag_registry[sample_id]}"
@@ -284,10 +293,8 @@ def image_file_to_base64(filepath: str, max_bytes: int = 3_700_000, max_dimensio
 def build_openai_client(api_key: str, base_url: str, use_azure: bool = False):
     if use_azure:
         from openai import AzureOpenAI
-        api_base = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+        api_base = os.environ.get("AZURE_OPENAI_ENDPOINT", base_url)
         api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2025-02-01-preview")
-        if not api_base:
-            raise ValueError("AZURE_OPENAI_ENDPOINT env var must be set when --use_azure_openai is used.")
         return AzureOpenAI(api_key=api_key, azure_endpoint=api_base, api_version=api_version)
     else:
         from openai import OpenAI
@@ -326,6 +333,7 @@ def resolve_api_mode(model: str, requested_mode: str) -> str:
 
 
 def image_to_base64_with_mime(image_path: str, max_bytes: int = 3_700_000, max_dimension: int = 1999):
+
     with Image.open(image_path) as img:
         fmt = img.format
     format_to_mime = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp", "GIF": "image/gif"}
@@ -484,7 +492,7 @@ def build_tool_schemas(args) -> List[dict]:
         schemas.append(ZOOM_IN_TOOL_SCHEMA)
     if args.use_tag:
         schemas.append(TAG_TOOL_SCHEMA)
-    if args.use_ocr or args.use_benign_ocr:
+    if args.use_ocr:
         schemas.append(OCR_TOOL_SCHEMA)
     if args.use_code_interpreter:
         schemas.append(CODE_INTERPRETER_TOOL_SCHEMA)
@@ -496,12 +504,12 @@ def build_output_filename(args) -> str:
     name += f"_{args.model_short}"
     if args.use_zoom_in:
         name += "_zoom_in"
+        if args.placebo_zoom:
+            name += "_placebo"
     if args.use_tag:
         name += "_tags"
     if args.use_ocr:
         name += "_ocr"
-    if args.use_benign_ocr:
-        name += "_benign_ocr"
     if args.use_code_interpreter:
         name += "_code_interpreter"
     name += f"_{args.prompt_type}"
@@ -587,6 +595,7 @@ def run_agent_loop(
     debug: bool = False,
     sample_id: Union[str, int] = None,
     code_interpreter_session: Optional[CodeInterpreterSession] = None,
+    placebo_zoom: bool = False,
 ) -> List[dict]:
     def _dbg(msg_str: str):
         if debug:
@@ -674,7 +683,8 @@ def run_agent_loop(
 
             try:
                 if func_name == "zoom_in":
-                    zoomed_b64 = execute_zoom_in(
+                    zoom_fn = execute_zoom_in_placebo if placebo_zoom else execute_zoom_in
+                    zoomed_b64 = zoom_fn(
                         image_path=primary_image_path,
                         ymin=args_dict["ymin"],
                         xmin=args_dict["xmin"],
@@ -697,7 +707,7 @@ def run_agent_loop(
                             },
                         ],
                     })
-                    _dbg(f"    ✅ zoom_in -> [image returned, {len(zoomed_b64)} chars base64]")
+                    _dbg(f"    ✅ zoom_in -> [image returned, {len(zoomed_b64)} chars base64] (placebo={placebo_zoom})")
 
                 elif func_name == "get_image_tags":
                     result_text = execute_get_tags(sample_id, tag_registry)
@@ -1107,18 +1117,13 @@ def load_tool_registries(args) -> tuple:
         with open(tag_path, "rb") as f:
             tag_registry = pickle.load(f)
 
-    if args.use_ocr or args.use_benign_ocr:
-        if args.use_benign_ocr:
-            ocr_path = args.ocr_path or os.path.join(args.save_path, f"{args.dataset_name}_id_2_benign_ocr.pkl")
-        else:
-            ocr_path = args.ocr_path or os.path.join(args.save_path, f"{args.dataset_name}_id_2_ocr.pkl")
+    if args.use_ocr:
+        ocr_path = args.ocr_path or os.path.join(args.save_path, f"{args.dataset_name}_id_2_ocr.pkl")
         print(f"Loading OCR from: {ocr_path}")
         if not os.path.exists(ocr_path):
             raise FileNotFoundError(f"OCR file not found at {ocr_path}")
         with open(ocr_path, "rb") as f:
             ocr_registry = pickle.load(f)
-
-    
 
     return tag_registry, ocr_registry
 
@@ -1139,30 +1144,33 @@ def parse_args():
                         help="Save temp file every N steps")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Process at most N unprocessed samples")
+    parser.add_argument("--sample_ids_file", type=str, default=None,
+                        help="Pickle file containing a list of sample_ids to restrict the run to.")
 
     parser.add_argument("--model", type=str,
-                        default="claude",
-                        help="Model name for the OpenAI-compatible API")
+                        default="claude-opus-4-6",
+                        help="Model id as expected by your OpenAI-compatible endpoint.")
     parser.add_argument("--api_key", type=str,
                         default=os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY"),
                         help="API key (or set API_KEY / OPENAI_API_KEY env var)")
     parser.add_argument("--base_url", type=str,
-                        default=os.environ.get("OPENAI_BASE_URL", ""),
+                        default=os.environ.get("OPENAI_BASE_URL"),
                         help="Base URL of OpenAI-compatible API")
     parser.add_argument("--api_mode", type=str, default="auto",
                         choices=["auto", "chat_completions", "responses"],
                         help="Which API style to use. auto selects responses for GPT-5/Codex-like models.")
 
     parser.add_argument("--use_zoom_in", action="store_true", help="Enable zoom_in tool")
+    parser.add_argument("--placebo_zoom", action="store_true",
+                        help="Placebo mode: zoom_in ignores the bbox and returns the original whole image. "
+                             "Keeps the tool invocation 'act' but removes any new visual information.")
     parser.add_argument("--use_tag", action="store_true", help="Enable get_image_tags tool")
     parser.add_argument("--use_ocr", action="store_true", help="Enable get_ocr_results tool")
-    parser.add_argument("--use_benign_ocr", action="store_true", help="Enable get_benign_ocr_results tool")
     parser.add_argument("--use_code_interpreter", action="store_true", help="Enable code_interpreter tool")
     parser.add_argument("--tag_path", type=str, default=None,
                         help="Optional override path for tag registry")
     parser.add_argument("--ocr_path", type=str, default=None,
                         help="Optional override path for OCR registry")
-    
 
     parser.add_argument("--code_interpreter_workspace_root", type=str, default=None,
                         help="Root directory for code interpreter workspaces")
@@ -1175,13 +1183,13 @@ def parse_args():
 
     parser.add_argument("--prompt_type", type=str, default="original_deep",
                         choices=["original", "original_deep", "no_tools", "no_tools_deep"],
-                        help="Prompt type")
+                        help="Prompt type. original / no_tools = minimal; *_deep = structured (see paper).")
 
     parser.add_argument("--max_iterations", type=int, default=50,
                         help="Max ReAct loop iterations per sample")
-    parser.add_argument("--max_code_interpreter_calls", type=int, default=50,
+    parser.add_argument("--max_code_interpreter_calls", type=int, default=8,
                         help="Abort a sample if code_interpreter is called this many times or more. Use 0 to disable.")
-    parser.add_argument("--max_same_code_interpreter_calls", type=int, default=50,
+    parser.add_argument("--max_same_code_interpreter_calls", type=int, default=3,
                         help="Abort a sample if essentially the same code_interpreter payload repeats this many times. Use 0 to disable.")
     parser.add_argument("--reasoning_effort", type=str, default=None,
                         choices=["minimal", "low", "medium", "high"],
@@ -1207,22 +1215,22 @@ def main():
         raise ValueError("API key must be provided via --api_key or API_KEY env var.")
 
     args.model_short = args.model.replace("/", "_")
-    SHORT_ALIASES = {
-        "claude46":     "anthropic/claude-opus-4-6",
-        "claude47":     "anthropic/claude-opus-4-7",
-        "gemini25":     "google/gemini-2.5-pro",
-        "gemini31":     "google/gemini-3.1-pro-preview",
-        "gemini3flash": "google/gemini-3-flash-preview",
-        "gpt54":        "openai/gpt-5.4",
-        "glm5turbo":    "zai/glm-5v-turbo",
-        "kimi_k25":     "moonshotai/Kimi-K2.5",
-        "kimi_k26":     "moonshotai/Kimi-K2.6",
-        "qwen35":       "Qwen/Qwen3.5-122B-A10B",
-    }
-    if args.model in SHORT_ALIASES:
-        if args.model.startswith("claude") and args.use_azure_openai:
-            raise ValueError("Claude is not supported for Azure OpenAI")
-        args.model = SHORT_ALIASES[args.model]
+    if args.model == 'claude':
+        args.model = "claude-opus-4-6"
+    elif args.model == 'gemini':
+        args.model = "gemini-2.5-pro"
+    elif args.model == 'kimi':
+        args.model = "kimi-k2.5"
+    elif args.model == 'gpt':
+        pass
+    elif args.model == 'qwen35':
+        args.model = "Qwen/Qwen3.5-122B-A10B"
+    elif args.model == 'qwen25vl':
+        args.model = "Qwen/Qwen2.5-VL-7B-Instruct"
+    elif "/" in args.model:
+        pass
+    else:
+        raise ValueError(f"Invalid model: {args.model}")
 
     os.makedirs(args.save_path, exist_ok=True)
 
@@ -1294,6 +1302,8 @@ def main():
                     code_interpreter_session=ci_session,
                 )
                 if api_mode == "responses":
+                    if args.placebo_zoom:
+                        raise NotImplementedError("--placebo_zoom is only wired up for chat_completions mode.")
                     result = run_agent_loop_responses(
                         **loop_kwargs,
                         reasoning_effort=args.reasoning_effort,
@@ -1301,7 +1311,7 @@ def main():
                         base_url=args.base_url,
                     )
                 else:
-                    result = run_agent_loop(**loop_kwargs)
+                    result = run_agent_loop(**loop_kwargs, placebo_zoom=args.placebo_zoom)
 
                 n_assistant = sum(1 for m in result if m.get("role") == "assistant")
                 n_tool = sum(1 for m in result if m.get("role") == "tool")
@@ -1346,6 +1356,13 @@ def main():
 
     processed_ids = set(id_2_result.keys())
     entries_to_process = [e for e in entries if e["sample_id"] not in processed_ids]
+
+    if args.sample_ids_file is not None:
+        with open(args.sample_ids_file, "rb") as f:
+            allowed_ids = set(pickle.load(f))
+        print(f"Restricting to {len(allowed_ids)} sample_ids from {args.sample_ids_file}")
+        entries_to_process = [e for e in entries_to_process if e["sample_id"] in allowed_ids]
+
     remaining_before_limit = len(entries_to_process)
     if args.max_samples is not None:
         if args.max_samples <= 0:
@@ -1385,6 +1402,8 @@ def main():
                 code_interpreter_session=ci_session,
             )
             if api_mode == "responses":
+                if args.placebo_zoom:
+                    raise NotImplementedError("--placebo_zoom is only wired up for chat_completions mode.")
                 result = run_agent_loop_responses(
                     **loop_kwargs,
                     reasoning_effort=args.reasoning_effort,
@@ -1392,7 +1411,7 @@ def main():
                     base_url=args.base_url,
                 )
             else:
-                result = run_agent_loop(**loop_kwargs)
+                result = run_agent_loop(**loop_kwargs, placebo_zoom=args.placebo_zoom)
             id_2_result[sample_id] = result
 
         except Exception as e:
